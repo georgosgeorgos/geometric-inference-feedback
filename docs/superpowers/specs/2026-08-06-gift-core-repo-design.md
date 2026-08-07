@@ -52,9 +52,14 @@ For iteration n = 1, 2, ..., max_iterations:
      → Dₙ = D₀ ∪ REJECT_pairs ∪ FDA_pairs ∪ OVERSAMPLE_pairs
      → Save as versioned Arrow dataset
 
-  6. RETRAIN
-     → Fine-tune Mₙ₋₁ on Dₙ using SFT with optional KL regularization
-     → Produces Mₙ
+  6. RETRAIN (two modes)
+     a. Offline SFT (`run_gift_loop.py`):
+        → Fine-tune Mₙ₋₁ on Dₙ using SFTSyncedGrad with optional KL regularization (ref = M₀)
+        → Produces Mₙ as a new checkpoint
+     b. Online RL (`run_gift_rl.py`):
+        → Train Mₙ₋₁ using REINFORCE/GRPO/DAPO with IoU as reward
+        → Generates candidates online, computes reward, updates weights in-place
+        → Syncs weights to VLLM server via PyNCCL after each step
 
   7. CHECKPOINT
      → Save Mₙ, log metrics (mean IoU, VSR, bucket counts, dataset size)
@@ -84,26 +89,29 @@ GIFT/
 │   │   ├── loop.py              # GIFTLoop orchestrator
 │   │   ├── reject.py            # GIFT-REJECT: filter by τ_accept
 │   │   ├── fda.py               # GIFT-FDA: render near-misses + pair with GT
-│   │   ├── renderer.py          # 3D→2D rendering pipeline
+│   │   ├── renderer.py          # 3D→2D rendering (PyVista + Xvfb)
 │   │   └── dataset_builder.py   # Combine buckets into HF dataset
 │   ├── inference/
-│   │   ├── __init__.py
-│   │   ├── vllm_client.py       # VLLM inference client
+│   │   ├── __init__.py          # run_code(), compute_iou() helpers
+│   │   ├── vllm_client.py       # VLLM inference client (+ NCCL weight sync for RL)
+│   │   ├── iou_client.py        # Async HTTP client for IoU server
 │   │   ├── iou_server.py        # IoU computation server
-│   │   ├── geom.py              # 3D IoU with shape alignment
+│   │   ├── geom.py              # 3D IoU with shape alignment (CadQuery)
 │   │   └── processors.py        # IOUProcessor (parallel IoU)
 │   ├── training/
 │   │   ├── __init__.py
-│   │   ├── sft_trainer.py       # SFTSyncedGrad trainer
-│   │   └── collators.py         # QwenVLCollator
+│   │   ├── sft_trainer.py       # SFTSyncedGrad trainer (offline SFT)
+│   │   ├── rl_trainer.py        # REINFORCE/GRPO/DAPO trainer (online RL)
+│   │   └── collators.py         # QwenVLCollator + QwenVLRLCollator
 │   └── data/
 │       ├── __init__.py
-│       ├── datasets.py          # MinimalImageCADDataset
+│       ├── datasets.py          # MinimalImageCADDataset (SFT) + CADRLDataset (RL)
 │       └── utils.py             # extract_code, image encoding helpers
 ├── demo/
 │   └── app.py                   # Gradio web UI
 ├── scripts/
-│   ├── run_gift_loop.py         # CLI entry point for full loop
+│   ├── run_gift_loop.py         # CLI entry point for full loop (offline SFT)
+│   ├── run_gift_rl.py           # CLI entry point for RL-based GIFT loop
 │   ├── run_iou_server.py        # Start IoU server
 │   └── run_vllm_server.py       # Start VLLM server
 ├── CLAUDE.md
@@ -118,8 +126,8 @@ Single dataclass holding all configuration:
 - Model identity (`base_model`, `dataset`)
 - GIFT loop parameters (`tau_accept`, `tau_reject`, `candidates_per_image`, `max_iterations`, `oversample_failures`, `oversample_factor`)
 - Inference parameters (`temperature`, `top_p`, `max_tokens`)
-- Training parameters (`lr`, `num_epochs`, `batch_size`, `use_kl`, `kl_weight`, `freeze_vision`)
-- Infrastructure (`iou_server_url`, `iou_workers`, `render_size`)
+- Training parameters (`lr`, `num_epochs`, `batch_size`, `use_kl`, `kl_weight`, `freeze_vision`, `training_mode` [sft|reinforce|grpo|dapo])
+- Infrastructure (`iou_server_url`, `iou_workers`, `use_iou_server`, `render_size`)
 - Paths (`output_dir`, `checkpoint_dir`)
 
 #### `gift/core/loop.py` — GIFTLoop
@@ -140,9 +148,9 @@ The main orchestrator. Accepts a `GIFTConfig` and runs the full bootstrapping lo
 
 #### `gift/core/renderer.py` — 3D→2D Rendering
 - `render_code_to_image(cadquery_code, size=(448, 448))` → PIL Image
-- Executes CadQuery code in subprocess → exports STEP → renders via headless OCC/VTK
-- Isolated subprocess execution to handle segfaults from OCC
-- Configurable render viewpoint and image size
+- Executes CadQuery code in subprocess → exports STL → renders via PyVista under Xvfb
+- Isolated subprocess execution to handle segfaults
+- Isometric view, white background (matching DeepCAD training images)
 
 #### `gift/core/dataset_builder.py` — Dataset Construction
 - `build_augmented_dataset(original_data, reject_pairs, fda_pairs, oversample_pairs)` → HuggingFace Dataset
@@ -151,19 +159,35 @@ The main orchestrator. Accepts a `GIFTConfig` and runs the full bootstrapping lo
 - Supports loading previous iteration datasets for comparison
 
 #### `gift/inference/` — Infrastructure (from CADRL)
-- `vllm_client.py`: VLLM API client for batch inference. Generates K candidates per image.
+- `__init__.py`: `run_code(code)` — subprocess execution of CadQuery code. `compute_iou(gt_step, gen_step)` — subprocess IoU via `geom.py`. `extract_code(text)` — regex extraction of Python from markdown. These are the simple helpers used by `InferenceScaling` and the RL pipeline.
+- `vllm_client.py`: VLLM API client for batch inference via OpenAI-compatible API. Generates K candidates per image. Includes NCCL weight sync methods (`init_communicator`, `update_model_params`) for the online RL path — the trainer pushes updated weights to the running VLLM server after each training step.
+- `iou_client.py`: `IOUClient` — async HTTP client for the IoU server. Uses `httpx` with semaphore-based concurrency control. Returns `(ious, statuses)` arrays. Used by the RL pipeline's `QwenVLRLCollator` to compute rewards.
 - `iou_server.py`: FastAPI server that accepts CadQuery code pairs and returns IoU scores. Uses ProcessPoolExecutor with subprocess isolation.
-- `geom.py`: `align_shapes()` — centers, scale-normalizes, and tries 4 rotation alignments to compute best 3D IoU.
-- `processors.py`: `IOUProcessor` — parallel IoU computation with checkpointing and resume support. This is the subprocess-based path (each IoU runs in its own Python subprocess using CadQuery). Used as a fallback when the IoU server is not running.
+- `geom.py`: `align_shapes()` — CadQuery-based 3D IoU with center-of-mass alignment, scale normalization via inertia tensor, and 4 rotation alignments. This is the ONLY IoU backend (pythonocc is not installed).
+- `processors.py`: `IOUProcessor` — parallel IoU computation with checkpointing and resume support. Each IoU runs in its own Python subprocess using CadQuery.
 
-**IoU computation path:** `GIFTLoop.run_iteration()` uses the IoU server (HTTP-based, `iou_server.py` + `geom_occ.py`) as the primary path for step 2 (EVALUATE). The `IOUProcessor` (subprocess-based, `processors.py` + `geom.py`) is available as a standalone fallback when no server is running. Config flag `use_iou_server: bool = True` controls which path is used.
+**IoU computation paths:**
+1. **IoU server** (`iou_server.py` + `iou_client.py`): HTTP-based, async. Primary path for both the GIFT loop and the RL pipeline. `IOUClient` provides the async interface.
+2. **Subprocess batch** (`processors.py`): Standalone parallel batch path with checkpointing. Fallback when no server is running.
+3. **Simple helpers** (`__init__.py`): `compute_iou()` — single-pair subprocess IoU. Used by `InferenceScaling`.
+
+All three paths use `geom.py` (CadQuery-based). Config flag `use_iou_server: bool = True` controls which path the loop uses.
 
 #### `gift/training/` — Training Infrastructure (from CADRL)
-- `sft_trainer.py`: `SFTSyncedGrad` — Accelerate-based SFT trainer with FSDP, manual gradient accumulation, global token-count normalization, KL regularization, WandB logging.
-- `collators.py`: `QwenVLCollator` — tokenizes chat-format prompts via Qwen2VLProcessor, masks non-assistant tokens.
+
+Two training paths, one file each:
+
+- `sft_trainer.py`: `SFTSyncedGrad` — Accelerate-based SFT trainer with FSDP, manual gradient accumulation, global token-count normalization, KL regularization (ref = M₀), WandB logging. Used by the **offline GIFT loop** (`run_gift_loop.py`): generate all candidates → build augmented dataset → retrain from checkpoint. This is the paper-faithful approach.
+- `rl_trainer.py`: Two classes from two source files:
+  - `REINFORCE` (from `Trainers/REINFORCE/`): vanilla policy gradient, loss = `-advantage * log_prob`, no clipping.
+  - `DAPO` (from `Trainers/DAPO/`): importance-sampled policy gradient with asymmetric clipping (`epsilon_low`/`epsilon_high`), `mu` inner training steps per batch.
+  - **GRPO is not a separate class** — it is `DAPO` with `mu=1` and `epsilon_high=epsilon_low` (symmetric clipping). This mapping is applied in `run_gift_rl.py`.
+  - Both trainers sync weights to VLLM via PyNCCL after each step. Standardize on DAPO's `get_model_state_dict()` approach (uses FSDP2 API with CPU offload, explicit cache clearing).
+  - Both trainers disable gradient checkpointing on frozen vision encoder to avoid recomputation issues under FSDP.
+- `collators.py`: `QwenVLCollator` (SFT path — tokenizes chat prompts, masks non-assistant tokens) + `QwenVLRLCollator` (RL path — generates via VLLM, computes IoU reward via `IOUClient`, per-group reward normalization, builds RL training batch). Also include `NoDaemonProcess`/`NoDaemonContext` utilities (required for RL dataloader — the collator spawns child processes for IoU, and standard multiprocessing forbids daemonic processes from having children).
 
 #### `gift/data/` — Data Handling (from CADRL)
-- `datasets.py`: `MinimalImageCADDataset` — wraps HuggingFace datasets with image+code columns, handles lazy loading, augmentation, prompt construction.
+- `datasets.py`: `MinimalImageCADDataset` (SFT path) + `CADRLDataset` (RL path — wraps prompts for VLLM generation with IoU reward).
 - `utils.py`: `extract_code()` (regex extraction from markdown), `encode_image()` (PIL→base64).
 
 ### 3.3 Demo — Gradio Web UI
@@ -173,7 +197,7 @@ The main orchestrator. Accepts a `GIFTConfig` and runs the full bootstrapping lo
 **Tab 1: Single Image Inference**
 - Upload an image of a 3D CAD model
 - Generate K candidates with configurable temperature
-- Display: input image, generated CadQuery code, IoU score, rendered 3D reconstruction
+- Display: input image, generated CadQuery code, IoU score, server-side rendered 2D image of 3D reconstruction
 - Best-of-K selection highlighted
 
 **Tab 2: GIFT Iteration Visualization**
@@ -196,48 +220,48 @@ The main orchestrator. Accepts a `GIFTConfig` and runs the full bootstrapping lo
 
 | CADRL Source | GIFT Destination | Changes |
 |---|---|---|
-| `Inference/Geom/_IOU.py` | `gift/inference/geom.py` | Keep `align_shapes`, `_compute_iou_centering`, `_compute_iou_centering_normalize`. Used by `processors.py` (subprocess path). |
-| `Inference/Geom/_OCC_IOU.py` | `gift/inference/geom_occ.py` | OCC-based IoU with `align_shapes`, `load_step_file`. Used by `iou_server.py` (HTTP server path). |
-| `Inference/processors.py` | `gift/inference/processors.py` | Keep `IOUProcessor` class and helper functions (`_run_gt_code`, `_run_gen_code`, `_compute_iou`). Update `PATH_TO_CAD_PYTHON` to be configurable. |
-| `Inference/iou_serve.py` | `gift/inference/iou_server.py` | Keep server endpoints. Make host/port/workers configurable. |
-| `Inference/VLLMClient.py` | `gift/inference/vllm_client.py` | Keep chat completion client. Remove NCCL weight sync methods (not needed for SFT loop — we retrain from checkpoint, not online). |
+| `Inference/Geom/_IOU.py` | `gift/inference/geom.py` | Keep `align_shapes`, `_compute_iou_centering`, `_compute_iou_centering_normalize`. This is the ONLY IoU backend (CadQuery-based). Used by both `processors.py` and `iou_server.py`. |
+| `Inference/processors.py` | `gift/inference/processors.py` | Keep `IOUProcessor` class and helper functions (`_run_gt_code`, `_run_gen_code`, `_compute_iou`). Update `PATH_TO_CAD_PYTHON` to be configurable. **Import path rewrite only** (already uses CadQuery-based `_IOU.py`): `from Inference.Geom._IOU import ...` → `from gift.inference.geom import ...`. |
+| `Inference/iou_serve.py` | `gift/inference/iou_server.py` | Keep server endpoints. **Backend switch + path rewrite**: uses `_OCC_IOU.py` (pythonocc, not installed) → adapt to use `geom.py` (CadQuery-based). Rewrite `from Geom._OCC_IOU import ...` → `from gift.inference.geom import ...`. Make host/port/workers configurable. |
+| `Inference/__init__.py` | `gift/inference/__init__.py` | Keep `run_code()`, `compute_iou()`, `extract_code()`. Update `PATH_TO_CAD_PYTHON` to be configurable. Rewrite import paths. Drop `compute_iou_serve()` (use `IOUClient` instead). |
+| `Inference/VLLMClient.py` | `gift/inference/vllm_client.py` | Keep full client including NCCL weight sync methods (`init_communicator`, `update_model_params`) — needed for the RL path. Keep `chat()`, `EZ_chat()`, `sleep()`/`wake_up()`. |
+| `Inference/IOUClient.py` | `gift/inference/iou_client.py` | Keep `IOUClient` as-is. Async HTTP client with retry logic and semaphore-based concurrency. |
 | `Trainers/SFT/__init__.py` | `gift/training/sft_trainer.py` | Keep `SFTSyncedGrad` only. Drop `SFT` class (redundant). Keep `selective_log_softmax`. |
-| `DataUtils/Collators.py` | `gift/training/collators.py` | Keep `QwenVLCollator` only. Drop `QwenVLRLCollator` (RL not used in GIFT). |
-| `DataUtils/Datasets.py` | `gift/data/datasets.py` | Keep `MinimalImageCADDataset` only. Drop `CADLMDataset` and `CADRLDataset`. Keep `extract_code` in utils.py. |
-| `Inference/InferenceScaling/render_step_pyvista_simple.py` | `gift/core/renderer.py` | Merge all 3 render backends into one module. Add `render_cadquery_to_image()` wrapper. |
-| `Inference/InferenceScaling/render.py` | `gift/core/renderer.py` | OCC Viewer3d high-quality backend (merged). |
-| `Inference/InferenceScaling/render_step_headless.py` | `gift/core/renderer.py` | VTK fallback backend (merged). |
+| `Trainers/REINFORCE/__init__.py` | `gift/training/rl_trainer.py` | `REINFORCE` class: vanilla policy gradient (`-advantage * log_prob`, no clipping). |
+| `Trainers/DAPO/__init__.py` | `gift/training/rl_trainer.py` | `DAPO` class: importance-sampled policy gradient with asymmetric clipping (`epsilon_low`/`epsilon_high`), inner training loops (`mu`). **GRPO is not a separate class** — it is `DAPO` with `mu=1` and `epsilon_high=epsilon_low` (symmetric clipping), applied in the entry point script. Standardize on DAPO's FSDP weight sync approach (`get_model_state_dict` with CPU offload). |
+| `CADCoderREINFORCE.py` | `scripts/run_gift_rl.py` | Adapt as CLI entry point. Keep algorithm dispatch (REINFORCE vs DAPO class, GRPO param mapping), dataset variant loading (base/rft/gift-fda/rft+gift-fda/all), vision freezing, `NoDaemonContext` setup. |
+| `DataUtils/Collators.py` | `gift/training/collators.py` | Keep both `QwenVLCollator` (SFT path) and `QwenVLRLCollator` (RL path — generates via VLLM, computes IoU reward). |
+| `DataUtils/Datasets.py` | `gift/data/datasets.py` | Keep `MinimalImageCADDataset` (SFT) + `CADRLDataset` (RL). Drop `CADLMDataset`. |
+| `DataUtils/Datasets.py` (lines 19-25) | `gift/data/utils.py` | Extract `extract_code()` regex helper. Add `encode_image()` (PIL→base64 for VLLM API). **Note:** `extract_code()` is duplicated in 3 CADRL files (`Datasets.py`, `Collators.py`, `Inference/__init__.py`). Centralize here; all other modules import from `gift.data.utils`. |
+| `Inference/InferenceScaling/render_step_pyvista_simple.py` | `gift/core/renderer.py` | Reuse PyVista rendering pattern (off_screen, view_isometric, white bg, STL mesh). New entry point: `render_code_to_image(code_str)` — executes CadQuery code string in subprocess, exports to STL, renders under Xvfb, returns PIL Image. The upstream pipeline (code execution → solid → STL) is new; the rendering itself reuses the CADRL pattern. |
+
+**Not copied:** `Inference/Geom/_OCC_IOU.py` (requires pythonocc, not installed), `Inference/InferenceScaling/render.py` (OCC Viewer3d, requires pythonocc), `Inference/InferenceScaling/render_step_headless.py` (VTK direct, superseded by PyVista path).
 
 ## 5. Rendering Pipeline (New)
 
-The FDA rendering pipeline is a new component not present in CADRL's training loop, but CADRL already has three rendering backends in `Inference/InferenceScaling/`:
+The FDA rendering pipeline is a new component not present in CADRL's training loop. It uses PyVista for headless 3D→2D rendering.
 
-### Available Rendering Backends (from CADRL)
+### Environment Constraints
 
-1. **OCC Viewer3d** (`render.py`): Highest quality — materials (shiny plastic/chrome), 3-point directional lighting, edge boundaries with `SetFaceBoundaryDraw(True)`, transparency. Uses `Viewer3d.Create()` offscreen. Requires EGL (`PYOPENGL_PLATFORM=egl`).
-
-2. **VTK offscreen** (`render_step_headless.py`): STEP → STL via OCC meshing → VTK offscreen rendering. More reliable for headless servers. Simpler visuals (flat gray, white background).
-
-3. **PyVista** (`render_step_pyvista_simple.py`): CadQuery → STL → `pv.Plotter(off_screen=True)`. Simplest API, most portable. Isometric view, smooth shading.
+- **pythonocc (`OCC.Core.*`) is NOT installed** — OCC Viewer3d rendering is unavailable
+- **PyVista 0.46.5 + VTK 9.3.1 are installed** — works for offscreen rendering
+- **Xvfb is required** — VTK's `vtkXOpenGLRenderWindow` needs an X display; `xvfb-run` provides a virtual one
+- Verified end-to-end: CadQuery → STL export → PyVista offscreen render → PNG ✓
 
 ### Approach for FDA
 1. Execute CadQuery code in a subprocess (isolated for crash safety, same pattern as `IOUProcessor._run_gen_code()`)
-2. Export the resulting solid to a STEP file via `cq.exporters.export(solid, path)`
-3. Render the STEP file to a 2D PNG using PyVista (default, most portable) with OCC Viewer3d as optional high-quality backend
+2. Export the resulting solid to STL via `cq.exporters.export(solid, path)`
+3. Render via PyVista under Xvfb: `pv.Plotter(off_screen=True)`, isometric view, white background
 4. Return as PIL Image at 448×448 (matching training data resolution)
 
-### Key Files Copied for Rendering
+### Renderer Implementation
 
-| CADRL Source | GIFT Destination | Notes |
-|---|---|---|
-| `Inference/InferenceScaling/render_step_pyvista_simple.py` | `gift/core/renderer.py` | Primary renderer, cleaned up with PIL return |
-| `Inference/InferenceScaling/render.py` | `gift/core/renderer.py` | OCC Viewer3d as optional high-quality backend |
-| `Inference/InferenceScaling/render_step_headless.py` | `gift/core/renderer.py` | VTK fallback |
-
-All three backends merged into a single `renderer.py` with a `render_cadquery_to_image(code, size, backend)` function that:
-- Executes CadQuery code in subprocess → exports STEP
-- Renders via selected backend (pyvista default, occ_viewer, vtk as fallbacks)
+Single `renderer.py` based on `Inference/InferenceScaling/render_step_pyvista_simple.py` with a `render_code_to_image(code, size)` function that:
+- Runs CadQuery code in a subprocess (with timeout, crash isolation)
+- Exports to temporary STL file
+- Launches PyVista under `xvfb-run` for headless rendering
 - Returns PIL Image
+- Cleans up temp files
 
 ### Viewpoint Matching
 The rendered FDA images should match the visual style of the training data (DeepCAD-CQ-Vision-Paired dataset). The training images use isometric views with white backgrounds. The PyVista renderer's `view_isometric()` with white background matches this.
@@ -270,9 +294,9 @@ HuggingFace Dataset (image, code)
          ▼
 ┌─── GIFT Classifier ─────────────────────────────────┐
 │                                                       │
-│  IoU ≥ τ_accept    →  REJECT bucket                  │
-│  τ_reject < IoU    →  FDA bucket → Renderer → pair   │
-│  IoU ≤ τ_reject    →  DISCARD                        │
+│  IoU ≥ τ_accept              →  REJECT bucket                  │
+│  τ_reject < IoU < τ_accept   →  FDA bucket → Renderer → pair   │
+│  IoU ≤ τ_reject              →  DISCARD                        │
 │  All discarded     →  OVERSAMPLE bucket              │
 │                                                       │
 └────────┬─────────────────────────────────────────────┘
@@ -285,14 +309,17 @@ HuggingFace Dataset (image, code)
 └────────┬─────────────┘
          │
          ▼
-┌─── SFT Trainer ──────┐
-│  Fine-tune Mₙ₋₁      │
-│  on augmented data    │
-│  → Mₙ checkpoint     │
-└───────────────────────┘
+┌─── Trainer ───────────────────────────────┐
+│  Mode A (SFT): Fine-tune Mₙ₋₁ on Dₙ     │
+│  Mode B (RL):  REINFORCE/GRPO/DAPO       │
+│                with IoU as reward         │
+│  → Mₙ checkpoint                         │
+└───────────────────────────────────────────┘
 ```
 
 ## 7. Dependencies
+
+### Python packages (all installed in `.cad` environment)
 
 ```
 # Core
@@ -302,12 +329,13 @@ accelerate
 datasets
 vllm
 
-# Geometry
-cadquery
-OCP  # OpenCascade Python bindings (via cadquery)
+# Geometry & IoU
+cadquery==2.6.0          # CadQuery with OCP bindings — INSTALLED
+                          # (pythonocc/OCC.Core is NOT installed and NOT needed)
 
 # Rendering
-pyvista  # or vtk for headless rendering
+pyvista==0.46.5          # INSTALLED — PyVista offscreen rendering
+vtk==9.3.1               # INSTALLED — backend for PyVista
 
 # Demo
 gradio>=4.0
@@ -315,11 +343,27 @@ gradio>=4.0
 # Infrastructure
 fastapi
 uvicorn
+uvloop
+httpx                    # Async HTTP client for IOUClient
+openai                   # OpenAI-compatible API client for VLLMClient
+requests                 # Sync HTTP for VLLMClient health checks
+qwen_vl_utils            # Vision processing for QwenVLCollator
 aiohttp
-joblib
 tqdm
 wandb
 ```
+
+### System dependencies
+
+```
+xorg-x11-server-Xvfb     # INSTALLED — required for headless PyVista rendering
+                          # All rendering subprocesses must run under `xvfb-run -a`
+```
+
+### NOT available (and not needed)
+
+- `pythonocc-core` / `OCC.Core.*` — not installed. We use CadQuery's native OCP bindings for IoU and CadQuery → STL → PyVista for rendering.
+- `trimesh` — not installed, not needed.
 
 ## 8. Environment
 
