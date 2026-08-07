@@ -1,0 +1,8 @@
+[project]
+name = "gift"
+version = "0.1.0"
+description = "GIFT: Geometric Inference Feedback Tuning for Image-to-CAD"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
