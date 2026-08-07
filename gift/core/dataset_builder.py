@@ -1,40 +1,51 @@
 """Build augmented HuggingFace datasets from GIFT loop outputs."""
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 from PIL import Image
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
+
+
+def _pairs_to_dataset(pairs: List[Tuple[Image.Image, str]], source: str) -> Dataset:
+    """Convert (image, code) pairs to a HF Dataset with source column."""
+    if not pairs:
+        return None
+    images, codes = zip(*pairs)
+    return Dataset.from_dict({
+        "image": list(images), "code": list(codes),
+        "source": [source] * len(pairs),
+    })
 
 
 def build_augmented_dataset(
-    base_data: List[Dict],
+    base_data: Union[Dataset, List[Dict]],
     reject_pairs: List[Tuple[Image.Image, str]],
     fda_pairs: List[Tuple[Image.Image, str]],
     oversample_pairs: List[Tuple[Image.Image, str]],
 ) -> Dataset:
-    """Combine base data with GIFT-generated pairs into a HuggingFace Dataset."""
-    images, codes, sources = [], [], []
+    """Combine base data with GIFT-generated pairs into a HuggingFace Dataset.
 
-    for item in base_data:
-        images.append(item["image"])
-        codes.append(item["code"])
-        sources.append("base")
+    base_data can be an HF Dataset (zero-copy) or a list of dicts (legacy).
+    """
+    if isinstance(base_data, Dataset):
+        base_ds = base_data
+        if "source" not in base_ds.column_names:
+            base_ds = base_ds.add_column("source", ["base"] * len(base_ds))
+    else:
+        base_ds = Dataset.from_dict({
+            "image": [d["image"] for d in base_data],
+            "code": [d["code"] for d in base_data],
+            "source": ["base"] * len(base_data),
+        })
 
-    for img, code in reject_pairs:
-        images.append(img)
-        codes.append(code)
-        sources.append("reject")
+    parts = [base_ds]
+    for pairs, source in [(reject_pairs, "reject"), (fda_pairs, "fda"), (oversample_pairs, "oversample")]:
+        ds = _pairs_to_dataset(pairs, source)
+        if ds is not None:
+            parts.append(ds)
 
-    for img, code in fda_pairs:
-        images.append(img)
-        codes.append(code)
-        sources.append("fda")
-
-    for img, code in oversample_pairs:
-        images.append(img)
-        codes.append(code)
-        sources.append("oversample")
-
-    return Dataset.from_dict({"image": images, "code": codes, "source": sources})
+    if len(parts) == 1:
+        return parts[0]
+    return concatenate_datasets(parts)
 
 
 def save_dataset(dataset: Dataset, output_dir: str, iteration: int) -> str:

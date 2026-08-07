@@ -3,7 +3,8 @@ import os
 import subprocess
 import tempfile
 import shutil
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from PIL import Image
 
 CAD_PYTHON = os.environ.get(
@@ -74,6 +75,25 @@ plotter.close()
         return result.returncode == 0 and os.path.exists(png_path)
     except (subprocess.TimeoutExpired, Exception):
         return False
+
+
+def render_codes_batch(
+    codes: List[str],
+    size: Tuple[int, int] = (448, 448),
+    max_workers: int = 8,
+    timeout: int = 30,
+) -> List[Optional[Image.Image]]:
+    """Render multiple CadQuery codes in parallel."""
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(render_code_to_image, c, size, timeout): i for i, c in enumerate(codes)}
+        results = [None] * len(codes)
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = None
+        return results
 
 
 def render_stl_to_image(

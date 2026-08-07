@@ -8,6 +8,7 @@ from gift.config import GIFTConfig
 from gift.core.reject import classify_candidates, build_reject_pairs
 from gift.core.fda import build_fda_pairs
 from gift.core.dataset_builder import build_augmented_dataset, save_dataset
+from gift.data.utils import extract_code
 
 logger = logging.getLogger(__name__)
 
@@ -23,84 +24,88 @@ class GIFTLoop:
     def run(self, start_iteration: int = 0):
         """Run all iterations of the GIFT loop."""
         self.iteration = start_iteration
+        data = load_dataset(self.config.dataset, split="train")
         for n in range(start_iteration, self.config.max_iterations):
             logger.info(f"=== GIFT Iteration {n + 1}/{self.config.max_iterations} ===")
-            metrics = self.run_iteration(n)
+            metrics = self.run_iteration(n, data)
             self.metrics.append(metrics)
             self._save_metrics()
             self.iteration = n + 1
 
-    def run_iteration(self, n: int) -> Dict:
+    def run_iteration(self, n: int, data=None) -> Dict:
         """Run a single GIFT iteration: generate -> evaluate -> classify -> build -> retrain."""
         from gift.inference.vllm_client import VLLMClient
         from gift.inference.iou_client import IOUClient
         import asyncio
 
-        data = load_dataset(self.config.dataset, split="train")
+        if data is None:
+            data = load_dataset(self.config.dataset, split="train")
 
+        K = self.config.candidates_per_image
+        N = len(data)
         vllm = VLLMClient(base_url=self.config.vllm_server_url)
         iou_client = IOUClient(server_url=self.config.iou_server_url)
 
-        # Step 1-2: Generate K candidates per image and evaluate IoU
-        logger.info(f"Generating {self.config.candidates_per_image} candidates per image...")
-        all_images, all_gt_codes, all_gen_codes, all_ious = [], [], [], []
+        # Step 1: Batch-generate K candidates per image (one HTTP call)
+        logger.info(f"Generating {K} candidates x {N} samples ({N * K} prompts)...")
+        all_prompts = []
+        for idx in range(N):
+            prompt = self._build_prompt(data[idx]["image"])
+            all_prompts.extend([prompt] * K)
+        all_responses = vllm.EZ_chat(all_prompts)
+        all_gen_codes = [extract_code(r) for r in all_responses]
 
-        for idx in range(len(data)):
-            sample = data[idx]
-            image = sample["image"]
-            gt_code = sample["code"]
+        # Step 2: Batch IoU evaluation (one asyncio.run)
+        logger.info(f"Evaluating IoU for {len(all_gen_codes)} candidates...")
+        all_jobs = []
+        for idx in range(N):
+            gt_code = data[idx]["code"]
+            for k in range(K):
+                all_jobs.append({"ground_truth": gt_code, "generated": all_gen_codes[idx * K + k]})
+        all_ious_flat, _ = asyncio.run(iou_client.main(all_jobs))
 
-            prompts = [self._build_prompt(image)] * self.config.candidates_per_image
-            responses = vllm.EZ_chat(prompts)
-            from gift.data.utils import extract_code
-            gen_codes = [extract_code(r) for r in responses]
-
-            jobs = [
-                {"ground_truth": gt_code, "generated": gc}
-                for gc in gen_codes
-            ]
-            ious, statuses = asyncio.run(iou_client.main(jobs))
-
-            all_images.append(image)
-            all_gt_codes.append(gt_code)
-            all_gen_codes.append(gen_codes)
-            all_ious.append(ious.tolist())
+        # Reshape into per-sample IoU lists and gen_codes
+        per_sample_ious = []
+        per_sample_codes = []
+        for idx in range(N):
+            start = idx * K
+            per_sample_ious.append(all_ious_flat[start:start + K].tolist())
+            per_sample_codes.append(all_gen_codes[start:start + K])
 
         # Step 3: Classify
         reject_pairs, fda_pairs, oversample_pairs = [], [], []
         n_accepted, n_fda, n_discarded = 0, 0, 0
 
-        for i in range(len(all_images)):
+        for i in range(N):
+            image = data[i]["image"]
+            gt_code = data[i]["code"]
             accepted, fda, discarded = classify_candidates(
-                all_ious[i], self.config.tau_accept, self.config.tau_reject,
+                per_sample_ious[i], self.config.tau_accept, self.config.tau_reject,
             )
             n_accepted += len(accepted)
             n_fda += len(fda)
             n_discarded += len(discarded)
 
             reject_pairs.extend(
-                build_reject_pairs(accepted, [all_images[i]] * len(all_gen_codes[i]), all_gen_codes[i])
+                build_reject_pairs(accepted, [image] * len(per_sample_codes[i]), per_sample_codes[i])
             )
-
             fda_pairs.extend(
-                build_fda_pairs(fda, all_gen_codes[i], [all_gt_codes[i]] * len(all_gen_codes[i]),
+                build_fda_pairs(fda, per_sample_codes[i], [gt_code] * len(per_sample_codes[i]),
                                 render_size=self.config.render_size)
             )
-
             if len(accepted) == 0 and len(fda) == 0 and self.config.oversample_failures:
-                oversample_pairs.extend(
-                    [(all_images[i], all_gt_codes[i])] * self.config.oversample_factor
-                )
+                oversample_pairs.extend([(image, gt_code)] * self.config.oversample_factor)
 
         # Step 4: Build augmented dataset
-        base_data = [{"image": data[i]["image"], "code": data[i]["code"]} for i in range(len(data))]
-        augmented = build_augmented_dataset(base_data, reject_pairs, fda_pairs, oversample_pairs)
+        augmented = build_augmented_dataset(data, reject_pairs, fda_pairs, oversample_pairs)
         save_dataset(augmented, self.config.output_dir, n)
 
         # Step 5: Retrain via SFT
         logger.info(f"Retraining on augmented dataset ({len(augmented)} samples)...")
         self._retrain(augmented, n)
 
+        total_ious = sum(sum(ious) for ious in per_sample_ious)
+        total_count = sum(len(ious) for ious in per_sample_ious)
         metrics = {
             "iteration": n,
             "n_accepted": n_accepted,
@@ -108,7 +113,7 @@ class GIFTLoop:
             "n_discarded": n_discarded,
             "n_oversample": len(oversample_pairs),
             "dataset_size": len(augmented),
-            "mean_iou": sum(sum(ious) for ious in all_ious) / max(sum(len(ious) for ious in all_ious), 1),
+            "mean_iou": total_ious / max(total_count, 1),
         }
         logger.info(f"Iteration {n} metrics: {json.dumps(metrics, indent=2)}")
         return metrics

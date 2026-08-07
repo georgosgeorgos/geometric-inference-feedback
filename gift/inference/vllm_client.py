@@ -285,12 +285,8 @@ class VLLMClient():
         """
         self.sleep()
         for name, param in model.named_parameters():
-            if exclude is not None:
-                for e in exclude:
-                    if e in name:
-                        # Skip this parameter if it matches any of the excluded keywords
-                        continue
-            # Update each parameter individually
+            if exclude is not None and any(e in name for e in exclude):
+                continue
             self.update_named_param(name, param.data)
         self.wake_up()
             
